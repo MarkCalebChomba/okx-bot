@@ -8,6 +8,8 @@ import traceback  # Add this import
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
+import json
+from pathlib import Path
 
 # Configuration
 API_CREDENTIALS = {
@@ -17,8 +19,8 @@ API_CREDENTIALS = {
 }
 
 TRADING_CONFIG = {
-    'symbol': '{coin}/USDT:USDT',
-    'leverage': 3,
+    'symbol': 'coin/USDT:USDT',
+    'leverage': 5,
     'timeframe': '15m',
     'historical_limit': 1500,  # Changed from 1000 to 1500 for better ML training
     'backtest_limit': 7500,   # Changed from 5000 to 7500 for more robust backtesting
@@ -30,6 +32,8 @@ RISK_CONFIG = {
     'max_position_size': 1.0,
     'min_confidence': 0.65    # Only keep confidence threshold
 }
+
+BLACKLIST_FILE = 'c:/Users/DELL/Desktop/DOGS/blacklist.json'
 
 # Indicator calculation functions
 def calculate_hull_ma(df, period=9):  # Changed from 14 to 9
@@ -297,16 +301,13 @@ class MLTradingBot:
             self.leverage = TRADING_CONFIG['leverage']
             self.timeframe = TRADING_CONFIG['timeframe']
             
-            # Initialize ML model
-            self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+            # Replace multiple models with single enhanced model
+            self.model = RandomForestClassifier(
+                n_estimators=150,  # Increased from 100 for better regime handling
+                max_depth=10,      # Limit depth to prevent overfitting
+                random_state=42
+            )
             self.scaler = StandardScaler()
-            
-            # Initialize ensemble model
-            self.models = {
-                'trending': RandomForestClassifier(n_estimators=100, random_state=42),
-                'ranging': RandomForestClassifier(n_estimators=100, random_state=43),
-                'volatile': RandomForestClassifier(n_estimators=100, random_state=44)
-            }
             
             print(f"Bot initialized with {self.symbol} on {self.timeframe} timeframe")
             
@@ -322,40 +323,30 @@ class MLTradingBot:
         try:
             df = self.calculate_all_indicators(df)
             
-            # Enhanced feature engineering
             X = pd.DataFrame()
             
-            # Price action features
+            # Add regime as numeric feature instead of categorical
+            regime = calculate_market_regime(df)
+            X['regime_volatile'] = (regime == 'volatile').astype(int)
+            X['regime_trending'] = (regime == 'trending').astype(int)
+            X['regime_ranging'] = (regime == 'ranging').astype(int)
+            
+            # Existing features
             X['price_momentum'] = df['Close'].pct_change(5)
             X['price_acceleration'] = X['price_momentum'].diff()
             X['volatility'] = calculate_volatility(df)
+            # ...existing feature calculations...
             
-            # Volume features
-            X['volume_momentum'] = df['Volume'].pct_change(5)
-            X['volume_price_trend'] = df['Volume'] * df['Close'].pct_change()
-            
-            # Technical features
-            X['hull_ma_trend'] = df['Hull_MA'].pct_change()
-            X['supertrend_signal'] = df['supertrend']
-            X['stoch_rsi_crossover'] = (df['stoch_rsi_k'] > df['stoch_rsi_d']).astype(int)
-            
-            # Market regime features
-            X['market_regime'] = calculate_market_regime(df)
-            X['trend_strength'] = calculate_trend_strength(df)
-            
-            # Institutional features
-            if 'institutional_flow' in df.columns:
-                X['inst_flow'] = df['institutional_flow']
-                X['inst_flow_ma'] = df['institutional_flow'].rolling(10).mean()
-                X['inst_flow_trend'] = X['inst_flow_ma'].pct_change()
+            # Add regime interaction features
+            X['trend_strength_in_trend'] = X['regime_trending'] * calculate_trend_strength(df)
+            X['volatility_in_volatile'] = X['regime_volatile'] * X['volatility']
+            X['momentum_in_ranging'] = X['regime_ranging'] * X['price_momentum']
             
             # Clean and scale features
             for col in X.columns:
-                if X[col].dtype != 'object':  # Skip categorical columns
-                    series = X[col].replace([np.inf, -np.inf], np.nan)
-                    X[col] = series.fillna(method='ffill').fillna(0)
-                    # Normalize using tanh instead of min-max scaling
-                    X[col] = np.tanh(X[col])
+                series = X[col].replace([np.inf, -np.inf], np.nan)
+                X[col] = series.fillna(method='ffill').fillna(0)
+                X[col] = np.tanh(X[col])
             
             return X
             
@@ -403,31 +394,37 @@ class MLTradingBot:
             raise e
 
     def predict_with_ensemble(self, features):
-        """Make predictions using regime-specific models"""
-        current_regime = features['market_regime'].iloc[-1]
-        feature_values = features.drop('market_regime', axis=1).iloc[-1:]
-        
-        # Get predictions from all models
-        predictions = {}
-        confidences = {}
-        
-        for regime, model in self.models.items():
-            if hasattr(model, 'classes_'):
-                pred = model.predict(feature_values)
-                conf = max(model.predict_proba(feature_values)[0])
-                predictions[regime] = pred[0]
-                confidences[regime] = conf
-        
-        # Weight predictions by regime relevance
-        if current_regime in predictions:
-            primary_prediction = predictions[current_regime]
-            primary_confidence = confidences[current_regime]
-        else:
-            # Fallback to ensemble average
-            primary_prediction = 1 if np.mean(list(predictions.values())) > 0.5 else 0
-            primary_confidence = np.mean(list(confidences.values()))
-        
-        return primary_prediction, primary_confidence
+        """Simplified prediction with single model"""
+        try:
+            feature_values = features.iloc[-1:] 
+            
+            # Make prediction and get confidence
+            pred = self.model.predict(feature_values)
+            conf = max(self.model.predict_proba(feature_values)[0])
+            
+            return pred[0], conf
+            
+        except Exception as e:
+            print(f"Prediction error: {str(e)}")
+            return 0, 0
+
+    def verify_trade_execution(self, order_id):
+        """Verify if trade was executed properly"""
+        try:
+            max_attempts = 5
+            attempt = 0
+            while attempt < max_attempts:
+                order = self.exchange.fetch_order(order_id, self.symbol)
+                if order['status'] == 'closed':
+                    return True
+                elif order['status'] == 'canceled' or order['status'] == 'expired':
+                    return False
+                time.sleep(2)
+                attempt += 1
+            return False
+        except Exception as e:
+            print(f"Trade verification error: {str(e)}")
+            return False
 
     def execute_trade(self, signal, confidence):
         try:
@@ -444,17 +441,12 @@ class MLTradingBot:
             
             # Calculate position size based on 1% of available balance
             balance_info = self.exchange.fetch_balance()
-            available_balance = balance_info['USDT']['free']  # adjust key if needed
+            available_balance = balance_info['USDT']['free']
             ticker = self.exchange.fetch_ticker(self.symbol)
             current_price = ticker['last']
             contract_size = 100
             trade_value = available_balance * 0.01
             desired_size = (trade_value / (current_price * contract_size)) * signal
-            
-            # Ensure a minimum acceptable trade size if 1% is too low
-            min_trade_size = 0.01
-            if abs(desired_size) < min_trade_size:
-                desired_size = min_trade_size * signal
             
             # Set leverage
             self.exchange.set_leverage(self.leverage, self.symbol)
@@ -478,7 +470,7 @@ class MLTradingBot:
                 side = 'buy' if desired_size > 0 else 'sell'
                 pos_side = 'long' if desired_size > 0 else 'short'
                 
-                self.exchange.create_order(
+                order = self.exchange.create_order(
                     self.symbol,
                     'market',
                     side,
@@ -490,11 +482,18 @@ class MLTradingBot:
                     }
                 )
                 
-                print(f"Trade executed: {side} {abs(desired_size)} {self.symbol} ({pos_side})")
-            
+                # Verify trade execution
+                if not self.verify_trade_execution(order['id']):
+                    print("Trade execution failed")
+                    return False
+                    
+                print(f"Trade executed and verified: {side} {abs(desired_size)} {self.symbol} ({pos_side})")
+                return True
+                
         except Exception as e:
             print(f"Trade execution error: {str(e)}")
             print("Stack trace:", traceback.format_exc())
+            return False
 
     def check_active_positions(self):
         """Check if there are any open positions"""
@@ -544,21 +543,18 @@ class MLTradingBot:
             # Split data for backtesting
             train_size = int(len(df) * 0.7)
             
-            # Handle categorical features
-            categorical_cols = ['market_regime']
-            numeric_features = features.drop(categorical_cols, axis=1)
-            train_features = numeric_features[:train_size]
+            # No need to handle categorical features anymore since they're already encoded
+            train_features = features[:train_size]
             train_labels = labels[:train_size]
-            test_features = numeric_features[train_size:]
+            test_features = features[train_size:]
             test_labels = labels[train_size:]
             
-            # Train on historical data
-            backtest_model = RandomForestClassifier(n_estimators=100, random_state=42)
-            backtest_model.fit(train_features, train_labels)
+            # Train the enhanced model
+            self.model.fit(train_features, train_labels)
             
             # Test predictions
-            predictions = backtest_model.predict(test_features)
-            confidence_scores = backtest_model.predict_proba(test_features)
+            predictions = self.model.predict(test_features)
+            confidence_scores = self.model.predict_proba(test_features)
             
             # Calculate results
             correct_predictions = sum(predictions == test_labels)
@@ -625,7 +621,7 @@ class MLTradingBot:
             
             # Return tuple of (success, accuracy, final_balance, returns)
             return (
-                accuracy > 0.55 and ((balance-1000)/1000)*100 > 5,
+                accuracy > 0.5 and ((balance-1000)/1000)*100 > 5,
                 accuracy * 100,
                 balance,
                 ((balance-1000)/1000)*100
@@ -717,24 +713,14 @@ class MLTradingBot:
                     
                     # Prepare features and make prediction
                     features = self.prepare_features(df)
-                    
-                    # Train regime-specific models if needed
-                    current_regime = features['market_regime'].iloc[-1]
-                    if not hasattr(self.models[current_regime], 'classes_'):
-                        print(f"Training {current_regime} model...")
-                        labels = (df['Close'].shift(-1) > df['Close']).astype(int)[:-1]
-                        regime_features = features[features['market_regime'] == current_regime].drop('market_regime', axis=1)
-                        if len(regime_features) > 0:
-                            self.models[current_regime].fit(regime_features[:-1], labels[:len(regime_features)-1])
-                    
-                    # Make ensemble prediction
                     prediction, confidence = self.predict_with_ensemble(features)
                     
                     # Execute trade with enhanced confidence check
                     if confidence > RISK_CONFIG['min_confidence']:
                         signal = 1 if prediction == 1 else -1
                         # Adjust signal strength based on regime
-                        if current_regime == 'volatile':
+                        current_regime = features['regime_volatile'].iloc[-1]
+                        if current_regime == 1:
                             signal *= 0.7  # Reduce position size in volatile markets
                         self.execute_trade(signal, confidence)
                     
@@ -756,20 +742,72 @@ class MLTradingBot:
             print("Stack trace:", traceback.format_exc())
             time.sleep(60)
 
+def load_blacklist():
+    try:
+        if Path(BLACKLIST_FILE).exists():
+            with open(BLACKLIST_FILE, 'r') as f:
+                return set(json.load(f))
+        return set()
+    except Exception:
+        return set()
+
+def save_blacklist(blacklist):
+    try:
+        with open(BLACKLIST_FILE, 'w') as f:
+            json.dump(list(blacklist), f)
+    except Exception as e:
+        print(f"Error saving blacklist: {e}")
+
 def run_backtest_all_coins():
-    while True:  # Add continuous operation loop
+    blacklist = load_blacklist()
+    while True:
         try:
-            coins = ['DOGE/USDT:USDT', 'PEPE/USDT:USDT', 'ADA/USDT:USDT', 'XRP/USDT:USDT']
+            # Updated list of coins with contract value < $1
+            coins = [
+                'DOGE/USDT:USDT',    # ~$0.07 per contract
+                'TRX/USDT:USDT',     # ~$0.08 per contract
+                'XRP/USDT:USDT',     # ~$0.60 per contract
+                'XLM/USDT:USDT',      # ~$0.11 per contract
+                'ADA/USDT:USDT',     # ~$0.60 per contract
+                'SHIB/USDT:USDT',    # ~$0.07 per contract
+                'DOGS/USDT:USDT',    # ~$0.07 per contract
+                'NOT/USDT:USDT',     # ~$0.07 per contract
+                            
+            ]
             results = {}
             best_coin = None
             best_accuracy = 0
             
-            for coin in coins:
+            # Filter out blacklisted coins
+            available_coins = [coin for coin in coins if coin not in blacklist]
+            if not available_coins:
+                print("All coins are blacklisted. Waiting 1 hour before resetting blacklist...")
+                time.sleep(3600)
+                blacklist.clear()
+                save_blacklist(blacklist)
+                continue
+                
+            for coin in available_coins:
                 print(f"\nRunning backtest for {coin}...")
                 bot = MLTradingBot()
                 bot.symbol = coin
                 
                 try:
+                    # Get market info before testing
+                    market = bot.exchange.market(coin)
+                    print("\nMarket Information:")
+                    print(f"Minimum Amount: {market['limits']['amount']['min']} contracts")
+                    print(f"Maximum Amount: {market['limits']['amount']['max']} contracts")
+                    print(f"Contract Size: {market.get('contractSize', 'N/A')}")
+                    print(f"Price Precision: {market['precision']['price']}")
+                    print(f"Amount Precision: {market['precision']['amount']}")
+                    
+                    # Calculate minimum position value in USDT
+                    ticker = bot.exchange.fetch_ticker(coin)
+                    min_position_value = market['limits']['amount']['min'] * ticker['last']
+                    print(f"Minimum Position Value: {min_position_value:.4f} USDT")
+                    print(f"Current Price: {ticker['last']} USDT")
+                    
                     # ...existing code...
                     backtest_data = bot.exchange.fetch_ohlcv(
                         bot.symbol,
@@ -802,6 +840,9 @@ def run_backtest_all_coins():
                 
                 except Exception as e:
                     print(f"Error testing {coin}: {str(e)}")
+                    print("Adding coin to blacklist...")
+                    blacklist.add(coin)
+                    save_blacklist(blacklist)
                     continue
             
             print("\n=== Complete Backtest Results ===")
@@ -811,29 +852,32 @@ def run_backtest_all_coins():
                 print(f"Returns: {metrics['Returns']:.2f}%")
                 print(f"Final Balance: {metrics['Final Balance']:.2f} USDT")
             
-            if best_coin and best_accuracy >= 55:
-                print(f"\nTrading best performing coin: {best_coin}")
-                print(f"Accuracy: {best_accuracy:.2f}%")
-                print(f"Expected Return: {results[best_coin]['Returns']:.2f}%")
-                
-                bot = MLTradingBot()
-                bot.symbol = best_coin
-                should_restart = bot.run()  # Capture restart signal
-                
+            if best_coin and best_accuracy >= 50:
+                try:
+                    bot = MLTradingBot()
+                    bot.symbol = best_coin
+                    should_restart = bot.run()
+                except Exception as e:
+                    print(f"Live trading error with {best_coin}: {str(e)}")
+                    print("Adding coin to blacklist...")
+                    blacklist.add(best_coin)
+                    save_blacklist(blacklist)
+                    continue
+                    
                 if should_restart:
                     print("Scheduled restart initiated...")
-                    time.sleep(5)  # Allow time for logs to be written
-                    continue  # Restart the entire process
+                    time.sleep(5)
+                    continue
             
             else:
-                print("\nNo coin met the minimum accuracy threshold of 55%. Waiting 15 minutes before retry...")
+                print("\nNo coin met the minimum accuracy threshold of 50%. Waiting 15 minutes before retry...")
                 time.sleep(900)  # Wait 15 minutes before trying again
         
         except Exception as e:
             print(f"Critical error in main loop: {str(e)}")
             print("Stack trace:", traceback.format_exc())
-            print("Restarting in 5 minutes...")
-            time.sleep(300)
+            print("Restarting in 5secs ...")
+            time.sleep(5)
 
 if __name__ == "__main__":
     print("Starting Enhanced ML Trading Bot...\n")
