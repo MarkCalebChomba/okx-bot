@@ -511,25 +511,68 @@ class MLTradingBot:
             current_price = float(ticker['last'])
             
             # Log detailed market information for debugging
-            print(f"\nMarket Information for {self.symbol}:")
+            print(f"\n----- Market Information for {self.symbol} -----")
             print(f"Current Price: {current_price} USDT")
             
             try:
-                contract_size = float(market.get('contractSize', 1))
-                print(f"Contract Size: {contract_size}")
+                # Get contract size and precision details with better error handling
+                contract_size = None
+                if 'contractSize' in market:
+                    contract_size = float(market['contractSize'])
+                    print(f"Contract Size from Market: {contract_size}")
+                else:
+                    # This is a fallback method for cases where contractSize isn't provided
+                    contract_size = 1.0  # For most coins like TRX, DOGE (= 1 coin per contract)
+                    if 'SHIB' in self.symbol:
+                        contract_size = 1000000.0  # SHIB uses 1M tokens per contract
+                    elif any(coin in self.symbol for coin in ['BTC']):
+                        contract_size = 0.001  # BTC uses 0.001 BTC per contract
+                    print(f"Contract Size (estimated): {contract_size}")
                 
                 # Extract precision information
-                amount_precision = int(market['precision'].get('amount', 0))
-                price_precision = int(market['precision'].get('price', 0))
-                print(f"Amount Precision: {amount_precision} digits")
-                print(f"Price Precision: {price_precision} digits")
+                amount_precision = None
+                if 'precision' in market and 'amount' in market['precision']:
+                    if isinstance(market['precision']['amount'], (int, float)):
+                        amount_precision = int(market['precision']['amount'])
+                        print(f"Amount Precision: {amount_precision} digits")
+                    else:
+                        amount_precision = 2
+                        print(f"Amount Precision defaulted to: {amount_precision} digits")
+                else:
+                    amount_precision = 2
+                    print(f"Amount Precision defaulted to: {amount_precision} digits")
+                
+                price_precision = None
+                if 'precision' in market and 'price' in market['precision']:
+                    if isinstance(market['precision']['price'], (int, float)):
+                        price_precision = int(market['precision']['price'])
+                        print(f"Price Precision: {price_precision} digits")
+                    else:
+                        price_precision = 2
+                        print(f"Price Precision defaulted to: {price_precision} digits")
+                else:
+                    price_precision = 2
+                    print(f"Price Precision defaulted to: {price_precision} digits")
                 
                 # Extract minimum limits
-                min_amount = float(market['limits']['amount']['min'])
-                print(f"Minimum Amount: {min_amount} contracts")
+                min_amount = None
+                if 'limits' in market and 'amount' in market['limits'] and 'min' in market['limits']['amount']:
+                    min_amount = float(market['limits']['amount']['min'])
+                    print(f"Minimum Amount: {min_amount} contracts")
+                else:
+                    min_amount = 0.01
+                    print(f"Minimum Amount defaulted to: {min_amount} contracts")
                 
-                min_cost = float(market['limits'].get('cost', {}).get('min', 0))
-                print(f"Minimum Cost: {min_cost} USDT")
+                min_cost = None
+                if 'limits' in market and 'cost' in market['limits'] and 'min' in market['limits']['cost']:
+                    min_cost = float(market['limits']['cost']['min'])
+                    print(f"Minimum Cost: {min_cost} USDT")
+                else:
+                    min_cost = 5.0
+                    print(f"Minimum Cost defaulted to: {min_cost} USDT")
+                
+                min_notional_value = min_amount * current_price * contract_size
+                print(f"Minimum Notional Value: {min_notional_value} USDT")
                 
             except (KeyError, TypeError, ValueError) as e:
                 print(f"Warning: Could not extract complete market information: {e}")
@@ -537,17 +580,32 @@ class MLTradingBot:
                 contract_size = 1.0
                 amount_precision = 2
                 price_precision = 2
-                min_amount = 1.0
+                min_amount = 0.01
                 min_cost = 5.0
+                min_notional_value = min_amount * current_price * contract_size
+                print(f"Using fallback values due to error: {e}")
             
             # Calculate position size with improved error handling
             balance_info = self.exchange.fetch_balance()
             available_balance = float(balance_info['USDT']['free'])
+            print(f"\n----- Account Information -----")
             print(f"Available Balance: {available_balance} USDT")
             
-            # Calculate position size based on risk percentage
+            # Calculate position size based on risk percentage (1% of balance)
             risk_amount_usdt = available_balance * RISK_CONFIG['position_size_pct']
             print(f"Risk Amount (1%): {risk_amount_usdt} USDT")
+            
+            # Validate against minimum possible trade
+            if risk_amount_usdt < (min_notional_value / self.leverage):
+                print(f"Warning: 1% risk ({risk_amount_usdt} USDT) is below minimum required for this market")
+                print(f"Minimum required: {min_notional_value / self.leverage} USDT with {self.leverage}x leverage")
+                if min_notional_value / self.leverage <= available_balance * 0.05:
+                    # Allow up to 5% risk for small accounts
+                    risk_amount_usdt = min_notional_value / self.leverage
+                    print(f"Adjusting risk amount to minimum: {risk_amount_usdt} USDT ({(risk_amount_usdt/available_balance)*100:.2f}% of balance)")
+                else:
+                    print("Error: Minimum trade exceeds 5% of balance - too risky")
+                    return False
             
             # Apply leverage to calculate notional value
             leveraged_value = risk_amount_usdt * self.leverage
@@ -555,22 +613,43 @@ class MLTradingBot:
             
             # Calculate contract quantity
             try:
-                # Calculate raw contract quantity
-                contract_quantity = leveraged_value / (current_price * contract_size)
-                print(f"Raw Contract Quantity: {contract_quantity}")
+                # Calculate raw contract quantity with clearer formula
+                nominal_exposure = leveraged_value  # This is how much exposure we want
+                contract_value = current_price * contract_size  # Value of one contract
+                
+                # The formula: contracts = (balance * risk * leverage) / (price * contract_size)
+                contract_quantity = nominal_exposure / contract_value
+                
+                print(f"Contract calculation: {nominal_exposure} USDT / ({current_price} USDT * {contract_size} units) = {contract_quantity} contracts")
+                
+                # Validate quantity before rounding
+                if contract_quantity <= 0:
+                    print(f"Error: Invalid contract quantity calculated: {contract_quantity}")
+                    return False
                 
                 # Round to market precision
-                contract_quantity = round(contract_quantity, amount_precision)
-                print(f"Rounded Contract Quantity: {contract_quantity} contracts")
+                if amount_precision == 0:
+                    # For markets that only accept whole number quantities
+                    contract_quantity = int(contract_quantity)
+                    print(f"Rounded to whole number: {contract_quantity} contracts")
+                else:
+                    # For markets that accept decimal quantities
+                    contract_quantity = round(contract_quantity, amount_precision)
+                    print(f"Rounded to precision {amount_precision}: {contract_quantity} contracts")
                 
                 # Check against minimum amount
                 if contract_quantity < min_amount:
-                    if min_amount * current_price * contract_size / self.leverage <= available_balance * 0.05:
+                    if min_amount * contract_value / self.leverage <= available_balance * 0.05:
                         print(f"Increasing quantity to minimum: {min_amount} contracts")
                         contract_quantity = min_amount
                     else:
                         print("Error: Minimum quantity exceeds 5% of available balance")
                         return False
+                
+                # Double-check the actual exposure
+                actual_exposure = contract_quantity * contract_value
+                actual_risk_pct = (actual_exposure / self.leverage) / available_balance
+                print(f"Actual exposure: {actual_exposure} USDT ({actual_risk_pct*100:.2f}% of balance with leverage)")
                 
                 # Set the position size with direction
                 desired_size = contract_quantity * (1 if signal > 0 else -1)
