@@ -13,13 +13,13 @@ from pathlib import Path
 
 # Configuration
 API_CREDENTIALS = {
-    'api_key': '074c23e1-6750-4ce2-a7a5-3b86c4a0a03f',
-    'secret_key': '07BB467EFE2A1DAE7B3AEA30738B61BF',
+    'api_key': '544d6587-0a7d-4b73-bb06-0e3656c08a18',
+    'secret_key': '9C2CA165254391E4B4638DE6577288BD',
     'passphrase': '#Dinywa15'
 }
 
 TRADING_CONFIG = {
-    'symbol': 'coin/USDT:USDT',
+    'symbol': 'TRX/USDT:USDT',  # Changed from 'coin/USDT:USDT' to a real symbol
     'leverage': 5,
     'timeframe': '15m',
     'historical_limit': 1500,  # Changed from 1000 to 1500 for better ML training
@@ -29,27 +29,38 @@ TRADING_CONFIG = {
 }
 
 RISK_CONFIG = {
-    'max_position_size': 1.0,
-    'min_confidence': 0.65    # Only keep confidence threshold
+    'position_size_pct': 0.01,  # Position percentage (1% of balance)
+    'min_confidence': 0.60,    # Lowered from 0.65 to 0.60 for more trades
+    'trailing_stop_initial': 0.05,  # Initial trailing stop distance (5%)
+    'trailing_stop_min': 0.02,  # Minimum trailing stop distance (2%)
+    'trailing_stop_max': 0.10   # Maximum trailing stop distance (10%)
 }
 
-BLACKLIST_FILE = 'c:/Users/DELL/Desktop/DOGS/blacklist.json'
-
 # Indicator calculation functions
-def calculate_hull_ma(df, period=9):  # Changed from 14 to 9
-    # Hull MA performs better with shorter periods for crypto due to higher volatility
+def calculate_hull_ma(df, period=9):
+    """Calculate Hull Moving Average with the given period"""
     half_period = int(period/2)
     sqrt_period = int(np.sqrt(period))
     
+    # Create DataFrame to store intermediate calculations
     weighted_data = pd.DataFrame(index=df.index)
+    
+    # Calculate half period weighted moving average
     weighted_data['half_period'] = df['Close'].rolling(window=half_period).apply(
         lambda x: np.average(x, weights=range(1, len(x)+1))
     )
+    
+    # Calculate full period weighted moving average
     weighted_data['full_period'] = df['Close'].rolling(window=period).apply(
         lambda x: np.average(x, weights=range(1, len(x)+1))
     )
+    
+    # Calculate raw Hull MA
     weighted_data['raw_hma'] = 2 * weighted_data['half_period'] - weighted_data['full_period']
+    
+    # Calculate final Hull MA
     hull_ma = weighted_data['raw_hma'].rolling(window=sqrt_period).mean()
+    
     return hull_ma
 
 def calculate_ichimoku(df):
@@ -301,13 +312,23 @@ class MLTradingBot:
             self.leverage = TRADING_CONFIG['leverage']
             self.timeframe = TRADING_CONFIG['timeframe']
             
-            # Replace multiple models with single enhanced model
+            # Initialize model with optimal parameters
             self.model = RandomForestClassifier(
-                n_estimators=150,  # Increased from 100 for better regime handling
-                max_depth=10,      # Limit depth to prevent overfitting
-                random_state=42
+                n_estimators=300,          # Increased for better accuracy
+                max_depth=8,               # Reduced to prevent overfitting
+                min_samples_split=10,      # Increased for more robust splits
+                min_samples_leaf=4,        # Increased for better stability
+                max_features='sqrt',       # Keep sqrt for feature selection
+                class_weight={0: 1.0, 1: 1.0},  # Adjusted to remove bias
+                random_state=42,
+                n_jobs=-1
             )
-            self.scaler = StandardScaler()
+            
+            # Add feature importance tracking
+            self.feature_importance = {}
+            
+            # Track trailing stops for positions
+            self.active_positions = {}
             
             print(f"Bot initialized with {self.symbol} on {self.timeframe} timeframe")
             
@@ -325,34 +346,73 @@ class MLTradingBot:
             
             X = pd.DataFrame()
             
-            # Add regime as numeric feature instead of categorical
+            # Market Regime Features
             regime = calculate_market_regime(df)
             X['regime_volatile'] = (regime == 'volatile').astype(int)
             X['regime_trending'] = (regime == 'trending').astype(int)
             X['regime_ranging'] = (regime == 'ranging').astype(int)
             
-            # Existing features
+            # Price Action Features
+            X['hull_ma_trend'] = (df['Close'] > df['Hull_MA']).astype(int)
             X['price_momentum'] = df['Close'].pct_change(5)
             X['price_acceleration'] = X['price_momentum'].diff()
             X['volatility'] = calculate_volatility(df)
-            # ...existing feature calculations...
             
-            # Add regime interaction features
-            X['trend_strength_in_trend'] = X['regime_trending'] * calculate_trend_strength(df)
+            # Ichimoku Features
+            X['above_tenkan'] = (df['Close'] > df['ichimoku_tenkan']).astype(int)
+            X['above_kijun'] = (df['Close'] > df['ichimoku_kijun']).astype(int)
+            
+            # Momentum Features
+            X['stoch_rsi_crossover'] = (df['stoch_rsi_k'] > df['stoch_rsi_d']).astype(int)
+            X['uo_oversold'] = (df['ultimate_oscillator'] < 30).astype(int)
+            X['uo_overbought'] = (df['ultimate_oscillator'] > 70).astype(int)
+            
+            # Trend Features
+            X['supertrend_direction'] = df['supertrend']
+            X['elder_bull_power'] = df['elder_bull']
+            X['elder_bear_power'] = df['elder_bear']
+            X['aroon_trend'] = (df['aroon_up'] > df['aroon_down']).astype(int)
+            
+            # Volume and Money Flow Features
+            X['institutional_flow'] = df['institutional_flow']
+            X['mfi_oversold'] = (df['mfi'] < 20).astype(int)
+            X['mfi_overbought'] = (df['mfi'] > 80).astype(int)
+            
+            # Interaction Features
+            X['trend_strength'] = calculate_trend_strength(df)
+            X['trend_strength_in_trend'] = X['regime_trending'] * X['trend_strength']
             X['volatility_in_volatile'] = X['regime_volatile'] * X['volatility']
             X['momentum_in_ranging'] = X['regime_ranging'] * X['price_momentum']
             
-            # Clean and scale features
+            # Clean and normalize features
             for col in X.columns:
                 series = X[col].replace([np.inf, -np.inf], np.nan)
                 X[col] = series.fillna(method='ffill').fillna(0)
-                X[col] = np.tanh(X[col])
+                X[col] = np.tanh(X[col])  # Normalize to [-1, 1]
             
             return X
             
         except Exception as e:
             print(f"Feature preparation error: {str(e)}")
             raise e
+
+    def analyze_feature_importance(self, features):
+        """Analyze and track feature importance"""
+        try:
+            importances = self.model.feature_importances_
+            feature_imp = pd.Series(importances, index=features.columns)
+            self.feature_importance = feature_imp.sort_values(ascending=False)
+            
+            print("\nTop 10 Most Important Features:")
+            print(self.feature_importance.head(10))
+            
+            # Remove low importance features (optional)
+            important_features = self.feature_importance[self.feature_importance > 0.01].index
+            return features[important_features]
+            
+        except Exception as e:
+            print(f"Feature importance analysis error: {str(e)}")
+            return features
 
     def calculate_all_indicators(self, df):
         try:
@@ -428,71 +488,230 @@ class MLTradingBot:
 
     def execute_trade(self, signal, confidence):
         try:
+            print(f"\nAttempting to execute trade - Signal: {signal}, Confidence: {confidence:.2f}")
+            
             # Get current position
             positions = self.exchange.fetch_positions([self.symbol])
-            current_size = 0
-            current_side = None
-            if positions:
-                for pos in positions:
-                    if pos['symbol'] == self.symbol:
-                        current_size = float(pos['contracts'])
-                        current_side = pos['side']
-                        break
+            current_position = None
             
-            # Calculate position size based on 1% of available balance
-            balance_info = self.exchange.fetch_balance()
-            available_balance = balance_info['USDT']['free']
+            for pos in positions:
+                if pos['symbol'] == self.symbol and float(pos['contracts']) > 0:
+                    current_position = {
+                        'side': pos['side'],
+                        'size': float(pos['contracts']),
+                        'entry_price': float(pos['entryPrice']),
+                        'leverage': float(pos['leverage']),
+                        'unrealizedPnl': float(pos['unrealizedPnl'])
+                    }
+                    break
+            
+            # Get market info for better quantity calculation
+            market = self.exchange.market(self.symbol)
             ticker = self.exchange.fetch_ticker(self.symbol)
-            current_price = ticker['last']
-            contract_size = 100
-            trade_value = available_balance * 0.01
-            desired_size = (trade_value / (current_price * contract_size)) * signal
+            current_price = float(ticker['last'])
             
-            # Set leverage
-            self.exchange.set_leverage(self.leverage, self.symbol)
+            # Log detailed market information for debugging
+            print(f"\nMarket Information for {self.symbol}:")
+            print(f"Current Price: {current_price} USDT")
             
-            # Close existing position if direction changes
-            if current_size != 0:
+            try:
+                contract_size = float(market.get('contractSize', 1))
+                print(f"Contract Size: {contract_size}")
+                
+                # Extract precision information
+                amount_precision = int(market['precision'].get('amount', 0))
+                price_precision = int(market['precision'].get('price', 0))
+                print(f"Amount Precision: {amount_precision} digits")
+                print(f"Price Precision: {price_precision} digits")
+                
+                # Extract minimum limits
+                min_amount = float(market['limits']['amount']['min'])
+                print(f"Minimum Amount: {min_amount} contracts")
+                
+                min_cost = float(market['limits'].get('cost', {}).get('min', 0))
+                print(f"Minimum Cost: {min_cost} USDT")
+                
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"Warning: Could not extract complete market information: {e}")
+                # Set fallback values
+                contract_size = 1.0
+                amount_precision = 2
+                price_precision = 2
+                min_amount = 1.0
+                min_cost = 5.0
+            
+            # Calculate position size with improved error handling
+            balance_info = self.exchange.fetch_balance()
+            available_balance = float(balance_info['USDT']['free'])
+            print(f"Available Balance: {available_balance} USDT")
+            
+            # Calculate position size based on risk percentage
+            risk_amount_usdt = available_balance * RISK_CONFIG['position_size_pct']
+            print(f"Risk Amount (1%): {risk_amount_usdt} USDT")
+            
+            # Apply leverage to calculate notional value
+            leveraged_value = risk_amount_usdt * self.leverage
+            print(f"Leveraged Value: {leveraged_value} USDT")
+            
+            # Calculate contract quantity
+            try:
+                # Calculate raw contract quantity
+                contract_quantity = leveraged_value / (current_price * contract_size)
+                print(f"Raw Contract Quantity: {contract_quantity}")
+                
+                # Round to market precision
+                contract_quantity = round(contract_quantity, amount_precision)
+                print(f"Rounded Contract Quantity: {contract_quantity} contracts")
+                
+                # Check against minimum amount
+                if contract_quantity < min_amount:
+                    if min_amount * current_price * contract_size / self.leverage <= available_balance * 0.05:
+                        print(f"Increasing quantity to minimum: {min_amount} contracts")
+                        contract_quantity = min_amount
+                    else:
+                        print("Error: Minimum quantity exceeds 5% of available balance")
+                        return False
+                
+                # Set the position size with direction
+                desired_size = contract_quantity * (1 if signal > 0 else -1)
+                
+            except (TypeError, ValueError, ZeroDivisionError) as e:
+                print(f"Error calculating position size: {e}")
+                return False
+            
+            # Set leverage with retry
+            max_leverage_attempts = 3
+            leverage_set = False
+            
+            for attempt in range(max_leverage_attempts):
+                try:
+                    self.exchange.set_leverage(self.leverage, self.symbol)
+                    leverage_set = True
+                    print(f"Leverage set to {self.leverage}x")
+                    break
+                except Exception as e:
+                    print(f"Leverage setting attempt {attempt + 1} failed: {str(e)}")
+                    time.sleep(1)
+            
+            if not leverage_set:
+                print("Failed to set leverage after multiple attempts")
+                return False
+            
+            # Check if we have an existing position
+            if current_position:
+                current_side = current_position['side']
+                signal_side = 'long' if signal > 0 else 'short'
+                
+                # If signal direction is opposite to current position, close it
                 if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
-                    self.exchange.create_order(
+                    print(f"Signal direction change detected: {current_side} -> {signal_side}")
+                    
+                    # Create order to close current position
+                    close_order = self.exchange.create_order(
                         self.symbol,
                         'market',
                         'buy' if current_side == 'short' else 'sell',
-                        abs(current_size),
-                        params={
-                            'posSide': 'short' if current_side == 'short' else 'long',
-                            'reduceOnly': True
-                        }
+                        current_position['size'],
+                        params={'reduceOnly': True}
                     )
-            
-            # Open new position
-            if abs(desired_size) > 0:
-                side = 'buy' if desired_size > 0 else 'sell'
-                pos_side = 'long' if desired_size > 0 else 'short'
-                
-                order = self.exchange.create_order(
-                    self.symbol,
-                    'market',
-                    side,
-                    abs(desired_size),
-                    params={
-                        'posSide': pos_side,
-                        'tdMode': 'cross',
-                        'leverage': self.leverage
-                    }
-                )
-                
-                # Verify trade execution
-                if not self.verify_trade_execution(order['id']):
-                    print("Trade execution failed")
-                    return False
                     
-                print(f"Trade executed and verified: {side} {abs(desired_size)} {self.symbol} ({pos_side})")
-                return True
+                    print(f"Closed existing {current_side} position: {close_order['id']}")
+                    print(f"Position size: {current_position['size']} contracts")
+                    print(f"Entry price: {current_position['entry_price']}")
+                    
+                    # Reset current position
+                    current_position = None
+                
+                # If signal matches current position direction, add to the position if confidence is high enough
+                elif (signal > 0 and current_side == 'long') or (signal < 0 and current_side == 'short'):
+                    # Only add if confidence is higher than threshold + 5%
+                    if confidence > (RISK_CONFIG['min_confidence'] + 0.05):
+                        print(f"Adding to existing {current_side} position")
+                        print(f"Current position: {current_position['size']} contracts at {current_position['entry_price']}")
+                        
+                        # Calculate new average entry price
+                        total_position_value = (current_position['size'] * current_position['entry_price']) + (abs(desired_size) * current_price)
+                        total_size = current_position['size'] + abs(desired_size)
+                        new_avg_entry = total_position_value / total_size
+                        
+                        # Create order to add to position
+                        side = 'buy' if signal > 0 else 'sell'
+                        try:
+                            order = self.exchange.create_order(
+                                self.symbol,
+                                'market',
+                                side,
+                                abs(desired_size),
+                                None,
+                                {'tdMode': 'cross', 'posSide': current_side}
+                            )
+                            
+                            print(f"Added to position: {order['id']}")
+                            print(f"Additional size: {abs(desired_size)} contracts")
+                            print(f"New total size: {total_size} contracts")
+                            print(f"New average entry: {new_avg_entry}")
+                            
+                            # Update position tracking
+                            if self.symbol in self.active_positions:
+                                self.active_positions[self.symbol].update({
+                                    'size': total_size,
+                                    'avg_entry': new_avg_entry,
+                                    'initial_stop': new_avg_entry * (1 - RISK_CONFIG['trailing_stop_initial'] if signal > 0 else 1 + RISK_CONFIG['trailing_stop_initial'])
+                                })
+                            
+                            return True
+                        except Exception as e:
+                            print(f"Error adding to position: {e}")
+                            return False
+                    else:
+                        print(f"Not adding to position - confidence {confidence:.2f} below threshold {RISK_CONFIG['min_confidence'] + 0.05:.2f}")
+                        return False
+            
+            # If no current position or position was closed, open a new one
+            if not current_position and abs(desired_size) >= min_amount:
+                side = 'buy' if signal > 0 else 'sell'
+                pos_side = 'long' if signal > 0 else 'short'
+                
+                try:
+                    order = self.exchange.create_order(
+                        self.symbol,
+                        'market',
+                        side,
+                        abs(desired_size),
+                        None,
+                        {'tdMode': 'cross', 'posSide': pos_side}
+                    )
+                    
+                    print(f"New position opened: {order['id']}")
+                    print(f"Trade details: {side} {abs(desired_size)} contracts at ~{current_price}")
+                    
+                    # Set up trailing stop tracking
+                    self.active_positions[self.symbol] = {
+                        'side': pos_side,
+                        'size': abs(desired_size),
+                        'entry_price': current_price,
+                        'current_price': current_price,
+                        'initial_stop': current_price * (1 - RISK_CONFIG['trailing_stop_initial'] if signal > 0 else 1 + RISK_CONFIG['trailing_stop_initial']),
+                        'current_stop': current_price * (1 - RISK_CONFIG['trailing_stop_initial'] if signal > 0 else 1 + RISK_CONFIG['trailing_stop_initial']),
+                        'highest_price': current_price if signal > 0 else float('-inf'),
+                        'lowest_price': current_price if signal < 0 else float('inf')
+                    }
+                    
+                    return True
+                except Exception as e:
+                    print(f"Error opening new position: {e}")
+                    print(traceback.format_exc())
+                    return False
+            else:
+                if current_position:
+                    print("Position unchanged - signal aligns with current position")
+                else:
+                    print(f"Position size {abs(desired_size)} is below minimum {min_amount}")
+                return False
                 
         except Exception as e:
             print(f"Trade execution error: {str(e)}")
-            print("Stack trace:", traceback.format_exc())
+            print(traceback.format_exc())
             return False
 
     def check_active_positions(self):
@@ -536,101 +755,195 @@ class MLTradingBot:
         return elapsed_time >= TRADING_CONFIG['restart_interval']
 
     def backtest(self, df, features, labels):
-        """Modified backtest method to return more metrics"""
+        """Run backtest on historical data"""
         try:
             print("\nRunning backtest on historical data...")
             
             # Split data for backtesting
             train_size = int(len(df) * 0.7)
             
-            # No need to handle categorical features anymore since they're already encoded
+            # Extract features for training and testing
             train_features = features[:train_size]
             train_labels = labels[:train_size]
             test_features = features[train_size:]
             test_labels = labels[train_size:]
             
-            # Train the enhanced model
+            # Train model
             self.model.fit(train_features, train_labels)
             
-            # Test predictions
+            # Get feature importance
+            feature_columns = train_features.columns
+            self.feature_importance = pd.Series(
+                self.model.feature_importances_, 
+                index=feature_columns
+            ).sort_values(ascending=False)
+            
+            # Print top 10 features
+            print("\nTop 10 Most Important Features:")
+            print(self.feature_importance.head(10))
+            
+            # Make predictions on test data
             predictions = self.model.predict(test_features)
             confidence_scores = self.model.predict_proba(test_features)
             
-            # Calculate results
+            # Calculate accuracy
             correct_predictions = sum(predictions == test_labels)
             accuracy = correct_predictions / len(test_labels)
             
             # Simulate trading
-            balance = 1000 # Starting with 1000 USDT
+            balance = 1000  # Starting with 1000 USDT
+            initial_balance = balance
             position = None
             test_prices = df['Close'][train_size:].values
             
             # Track trades for analysis
             trades = []
+            
             for i in range(len(predictions)):
                 confidence = max(confidence_scores[i])
+                signal = 1 if predictions[i] == 1 else -1
+                
+                # Only trade if confidence is sufficient
                 if confidence > RISK_CONFIG['min_confidence']:
-                    signal = 1 if predictions[i] == 1 else -1
-                    
-                    # Close existing position
-                    if position:
+                    # Close existing position if direction changes
+                    if position and ((signal > 0 and position['side'] < 0) or (signal < 0 and position['side'] > 0)):
+                        # Calculate profit/loss
                         pnl = position['size'] * (test_prices[i] - position['entry']) * position['side']
                         balance += pnl
+                        
                         trades.append({
                             'exit_price': test_prices[i],
                             'pnl': pnl,
-                            'balance': balance
+                            'balance': balance,
+                            'hold_bars': i - position['entry_bar']
                         })
+                        
                         position = None
                     
-                    # Open new position
-                    if signal != 0:
+                    # Open new position if none exists
+                    if position is None:
+                        position_size = (balance * RISK_CONFIG['position_size_pct']) / test_prices[i]
+                        
                         position = {
                             'side': signal,
                             'entry': test_prices[i],
-                            'size': (balance * 0.1) / test_prices[i]  # 10% of balance
+                            'size': position_size,
+                            'entry_bar': i,
+                            'trailing_stop': test_prices[i] * (1 - RISK_CONFIG['trailing_stop_initial'] if signal > 0 else 1 + RISK_CONFIG['trailing_stop_initial'])
                         }
+                        
                         trades.append({
+                            'entry_bar': i,
                             'entry_price': test_prices[i],
-                            'side': 'long' if signal == 1 else 'short',
-                            'size': position['size']
+                            'side': 'long' if signal > 0 else 'short',
+                            'size': position_size
                         })
+                
+                # Update trailing stop if position exists
+                if position:
+                    if position['side'] > 0:  # Long position
+                        # Update highest price seen
+                        highest_price = max(test_prices[i], position.get('highest_price', test_prices[i]))
+                        position['highest_price'] = highest_price
+                        
+                        # Calculate new stop based on volatility
+                        price_range = df['High'][train_size+i] - df['Low'][train_size+i]
+                        atr_factor = min(max(price_range / test_prices[i], RISK_CONFIG['trailing_stop_min']), RISK_CONFIG['trailing_stop_max'])
+                        
+                        new_stop = highest_price * (1 - atr_factor)
+                        
+                        # Only move stop up, never down
+                        if new_stop > position['trailing_stop']:
+                            position['trailing_stop'] = new_stop
+                        
+                        # Check if stop is hit
+                        if test_prices[i] < position['trailing_stop']:
+                            pnl = position['size'] * (position['trailing_stop'] - position['entry'])
+                            balance += pnl
+                            
+                            trades.append({
+                                'exit_price': position['trailing_stop'],
+                                'pnl': pnl,
+                                'balance': balance,
+                                'hold_bars': i - position['entry_bar'],
+                                'exit_type': 'trailing_stop'
+                            })
+                            
+                            position = None
+                    
+                    else:  # Short position
+                        # Update lowest price seen
+                        lowest_price = min(test_prices[i], position.get('lowest_price', test_prices[i]))
+                        position['lowest_price'] = lowest_price
+                        
+                        # Calculate new stop based on volatility
+                        price_range = df['High'][train_size+i] - df['Low'][train_size+i]
+                        atr_factor = min(max(price_range / test_prices[i], RISK_CONFIG['trailing_stop_min']), RISK_CONFIG['trailing_stop_max'])
+                        
+                        new_stop = lowest_price * (1 + atr_factor)
+                        
+                        # Only move stop down, never up
+                        if new_stop < position['trailing_stop'] or position['trailing_stop'] == 0:
+                            position['trailing_stop'] = new_stop
+                        
+                        # Check if stop is hit
+                        if test_prices[i] > position['trailing_stop']:
+                            pnl = position['size'] * (position['entry'] - position['trailing_stop'])
+                            balance += pnl
+                            
+                            trades.append({
+                                'exit_price': position['trailing_stop'],
+                                'pnl': pnl,
+                                'balance': balance,
+                                'hold_bars': i - position['entry_bar'],
+                                'exit_type': 'trailing_stop'
+                            })
+                            
+                            position = None
             
-            # Close final position
+            # Close any remaining position at the end
             if position:
-                pnl = position['size'] * (test_prices[-1] - position['entry']) * position['side']
+                if position['side'] > 0:
+                    pnl = position['size'] * (test_prices[-1] - position['entry'])
+                else:
+                    pnl = position['size'] * (position['entry'] - test_prices[-1])
+                    
                 balance += pnl
+                
                 trades.append({
                     'exit_price': test_prices[-1],
                     'pnl': pnl,
-                    'balance': balance
+                    'balance': balance,
+                    'hold_bars': len(test_prices) - position['entry_bar'],
+                    'exit_type': 'end_of_test'
                 })
             
-            # Print detailed results
+            # Calculate performance metrics
+            winning_trades = sum(1 for t in trades if t.get('pnl', 0) > 0)
+            total_trades = sum(1 for t in trades if 'pnl' in t)
+            
+            win_rate = winning_trades / total_trades if total_trades > 0 else 0
+            profit_factor = sum(t.get('pnl', 0) for t in trades if t.get('pnl', 0) > 0) / abs(sum(t.get('pnl', 0) for t in trades if t.get('pnl', 0) < 0)) if sum(t.get('pnl', 0) for t in trades if t.get('pnl', 0) < 0) != 0 else float('inf')
+            
+            returns = ((balance - initial_balance) / initial_balance) * 100
+            
+            # Print backtest results
             print(f"\nBacktest Results:")
             print(f"Accuracy: {accuracy:.2%}")
+            print(f"Win Rate: {win_rate:.2%}")
+            print(f"Total Trades: {total_trades}")
+            print(f"Profit Factor: {profit_factor:.2f}")
             print(f"Final Balance: {balance:.2f} USDT")
-            print(f"Return: {((balance-1000)/1000)*100:.2f}%")
-            print(f"Total Trades: {len(trades)}")
+            print(f"Return: {returns:.2f}%")
             
-            # Calculate additional metrics
-            winning_trades = sum(1 for t in trades if t.get('pnl', 0) > 0)
-            if len(trades) > 0:
-                win_rate = winning_trades / len(trades)
-                print(f"Win Rate: {win_rate:.2%}")
-            
-            # Return tuple of (success, accuracy, final_balance, returns)
-            return (
-                accuracy > 0.5 and ((balance-1000)/1000)*100 > 5,
-                accuracy * 100,
-                balance,
-                ((balance-1000)/1000)*100
-            )
+            # Return multiple values - ONLY check accuracy, not returns
+            is_successful = accuracy > 0.5
+            return is_successful, accuracy * 100, balance, returns
             
         except Exception as e:
             print(f"Backtest error: {str(e)}")
             print("Stack trace:", traceback.format_exc())
-            return False, 0, 1000, 0
+            return False, 0, 0, 0
 
     def run(self):
         print("Starting Enhanced ML Trading Bot...")
@@ -656,11 +969,11 @@ class MLTradingBot:
             backtest_features = self.prepare_features(backtest_df)
             backtest_labels = (backtest_df['Close'].shift(-1) > backtest_df['Close']).astype(int)[:-1]
             
-            # Run backtest
-            if not self.backtest(backtest_df, backtest_features[:-1], backtest_labels):
-                print("Backtest results unsatisfactory. Consider adjusting strategy.")
-                if input("Continue anyway? (y/n): ").lower() != 'y':
-                    return False
+            # Run backtest - properly unpack the multi-value return
+            is_successful, accuracy, final_balance, returns = self.backtest(backtest_df, backtest_features[:-1], backtest_labels)
+            
+            if not is_successful:
+                print("Backtest results unsatisfactory. Continuing anyway with trading.")
             
             print("\nStarting live trading...")
             
@@ -715,14 +1028,20 @@ class MLTradingBot:
                     features = self.prepare_features(df)
                     prediction, confidence = self.predict_with_ensemble(features)
                     
+                    # Log prediction details whether we trade or not
+                    print(f"Prediction: {'UP' if prediction == 1 else 'DOWN'}, Confidence: {confidence:.2f}, Min Threshold: {RISK_CONFIG['min_confidence']:.2f}")
+                    
                     # Execute trade with enhanced confidence check
                     if confidence > RISK_CONFIG['min_confidence']:
                         signal = 1 if prediction == 1 else -1
+                        print(f"⚠️ Signal triggered: {'LONG' if signal > 0 else 'SHORT'} with confidence {confidence:.2f}")
                         # Adjust signal strength based on regime
                         current_regime = features['regime_volatile'].iloc[-1]
                         if current_regime == 1:
                             signal *= 0.7  # Reduce position size in volatile markets
                         self.execute_trade(signal, confidence)
+                    else:
+                        print(f"No trade - confidence {confidence:.2f} below threshold {RISK_CONFIG['min_confidence']:.2f}")
                     
                     # If restarting and no positions, exit
                     if self.is_restarting and not self.check_active_positions():
@@ -730,6 +1049,7 @@ class MLTradingBot:
                         return True
                     
                     # Wait before next iteration
+                    print(f"Waiting 60 seconds until next check...")
                     time.sleep(60)
                 
                 except Exception as e:
@@ -742,52 +1062,23 @@ class MLTradingBot:
             print("Stack trace:", traceback.format_exc())
             time.sleep(60)
 
-def load_blacklist():
-    try:
-        if Path(BLACKLIST_FILE).exists():
-            with open(BLACKLIST_FILE, 'r') as f:
-                return set(json.load(f))
-        return set()
-    except Exception:
-        return set()
-
-def save_blacklist(blacklist):
-    try:
-        with open(BLACKLIST_FILE, 'w') as f:
-            json.dump(list(blacklist), f)
-    except Exception as e:
-        print(f"Error saving blacklist: {e}")
-
 def run_backtest_all_coins():
-    blacklist = load_blacklist()
     while True:
         try:
-            # Updated list of coins with contract value < $1
+            # List of coins with contract value < $1
             coins = [
                 'DOGE/USDT:USDT',    # ~$0.07 per contract
                 'TRX/USDT:USDT',     # ~$0.08 per contract
                 'XRP/USDT:USDT',     # ~$0.60 per contract
-                'XLM/USDT:USDT',      # ~$0.11 per contract
+                'XLM/USDT:USDT',     # ~$0.11 per contract
                 'ADA/USDT:USDT',     # ~$0.60 per contract
                 'SHIB/USDT:USDT',    # ~$0.07 per contract
-                'DOGS/USDT:USDT',    # ~$0.07 per contract
-                'NOT/USDT:USDT',     # ~$0.07 per contract
-                            
             ]
             results = {}
             best_coin = None
             best_accuracy = 0
             
-            # Filter out blacklisted coins
-            available_coins = [coin for coin in coins if coin not in blacklist]
-            if not available_coins:
-                print("All coins are blacklisted. Waiting 1 hour before resetting blacklist...")
-                time.sleep(3600)
-                blacklist.clear()
-                save_blacklist(blacklist)
-                continue
-                
-            for coin in available_coins:
+            for coin in coins:
                 print(f"\nRunning backtest for {coin}...")
                 bot = MLTradingBot()
                 bot.symbol = coin
@@ -808,7 +1099,7 @@ def run_backtest_all_coins():
                     print(f"Minimum Position Value: {min_position_value:.4f} USDT")
                     print(f"Current Price: {ticker['last']} USDT")
                     
-                    # ...existing code...
+                    # Fetch historical data
                     backtest_data = bot.exchange.fetch_ohlcv(
                         bot.symbol,
                         bot.timeframe,
@@ -826,6 +1117,7 @@ def run_backtest_all_coins():
                     backtest_features = bot.prepare_features(backtest_df)
                     backtest_labels = (backtest_df['Close'].shift(-1) > backtest_df['Close']).astype(int)[:-1]
                     
+                    # Run backtest and unpack the multiple return values
                     is_successful, accuracy, final_balance, returns = bot.backtest(backtest_df, backtest_features[:-1], backtest_labels)
                     
                     results[coin] = {
@@ -840,9 +1132,6 @@ def run_backtest_all_coins():
                 
                 except Exception as e:
                     print(f"Error testing {coin}: {str(e)}")
-                    print("Adding coin to blacklist...")
-                    blacklist.add(coin)
-                    save_blacklist(blacklist)
                     continue
             
             print("\n=== Complete Backtest Results ===")
@@ -859,9 +1148,6 @@ def run_backtest_all_coins():
                     should_restart = bot.run()
                 except Exception as e:
                     print(f"Live trading error with {best_coin}: {str(e)}")
-                    print("Adding coin to blacklist...")
-                    blacklist.add(best_coin)
-                    save_blacklist(blacklist)
                     continue
                     
                 if should_restart:
