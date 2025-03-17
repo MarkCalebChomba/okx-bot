@@ -19,21 +19,28 @@ API_CREDENTIALS = {
 }
 
 TRADING_CONFIG = {
-    'symbol': 'TRX/USDT:USDT',  # Changed from 'coin/USDT:USDT' to a real symbol
+    'symbol': 'DOGE/USDT:USDT',  # Changed to focus exclusively on DOGE
     'leverage': 5,
     'timeframe': '15m',
-    'historical_limit': 1500,  # Changed from 1000 to 1500 for better ML training
-    'backtest_limit': 7500,   # Changed from 5000 to 7500 for more robust backtesting
+    'historical_limit': 1500,
+    'backtest_limit': 7500,
     'retrain_interval': 60,
     'restart_interval': 6 * 60 * 60  # 6 hours in seconds
 }
 
 RISK_CONFIG = {
     'position_size_pct': 0.01,  # Position percentage (1% of balance)
-    'min_confidence': 0.60,    # Lowered from 0.65 to 0.60 for more trades
-    'trailing_stop_initial': 0.05,  # Initial trailing stop distance (5%)
-    'trailing_stop_min': 0.02,  # Minimum trailing stop distance (2%)
+    'min_confidence': 0.57,    # Confidence threshold for trades
+    'trailing_stop_initial': 0.2,  # Initial trailing stop distance (5%)
+    'trailing_stop_min': 0.2,  # Minimum trailing stop distance (2%)
     'trailing_stop_max': 0.10   # Maximum trailing stop distance (10%)
+}
+
+# DOGE-specific contract configuration
+DOGE_CONFIG = {
+    'contract_size': 1000,      # Each contract is 1000 DOGE
+    'min_contracts': 0.01,     # Minimum order size is 0.01 contracts (corrected from 0.1)
+    'precision': 2             # Round to 2 decimal places (changed from 1 to allow for 0.03 contracts)
 }
 
 # Indicator calculation functions
@@ -514,144 +521,96 @@ class MLTradingBot:
             print(f"\n----- Market Information for {self.symbol} -----")
             print(f"Current Price: {current_price} USDT")
             
-            try:
-                # Get contract size and precision details with better error handling
-                contract_size = None
-                if 'contractSize' in market:
-                    contract_size = float(market['contractSize'])
-                    print(f"Contract Size from Market: {contract_size}")
-                else:
-                    # This is a fallback method for cases where contractSize isn't provided
-                    contract_size = 1.0  # For most coins like TRX, DOGE (= 1 coin per contract)
-                    if 'SHIB' in self.symbol:
-                        contract_size = 1000000.0  # SHIB uses 1M tokens per contract
-                    elif any(coin in self.symbol for coin in ['BTC']):
-                        contract_size = 0.001  # BTC uses 0.001 BTC per contract
-                    print(f"Contract Size (estimated): {contract_size}")
-                
-                # Extract precision information
-                amount_precision = None
-                if 'precision' in market and 'amount' in market['precision']:
-                    if isinstance(market['precision']['amount'], (int, float)):
-                        amount_precision = int(market['precision']['amount'])
-                        print(f"Amount Precision: {amount_precision} digits")
-                    else:
-                        amount_precision = 2
-                        print(f"Amount Precision defaulted to: {amount_precision} digits")
-                else:
-                    amount_precision = 2
-                    print(f"Amount Precision defaulted to: {amount_precision} digits")
-                
-                price_precision = None
-                if 'precision' in market and 'price' in market['precision']:
-                    if isinstance(market['precision']['price'], (int, float)):
-                        price_precision = int(market['precision']['price'])
-                        print(f"Price Precision: {price_precision} digits")
-                    else:
-                        price_precision = 2
-                        print(f"Price Precision defaulted to: {price_precision} digits")
-                else:
-                    price_precision = 2
-                    print(f"Price Precision defaulted to: {price_precision} digits")
-                
-                # Extract minimum limits
-                min_amount = None
-                if 'limits' in market and 'amount' in market['limits'] and 'min' in market['limits']['amount']:
-                    min_amount = float(market['limits']['amount']['min'])
-                    print(f"Minimum Amount: {min_amount} contracts")
-                else:
-                    min_amount = 0.01
-                    print(f"Minimum Amount defaulted to: {min_amount} contracts")
-                
-                min_cost = None
-                if 'limits' in market and 'cost' in market['limits'] and 'min' in market['limits']['cost']:
-                    min_cost = float(market['limits']['cost']['min'])
-                    print(f"Minimum Cost: {min_cost} USDT")
-                else:
-                    min_cost = 5.0
-                    print(f"Minimum Cost defaulted to: {min_cost} USDT")
-                
-                min_notional_value = min_amount * current_price * contract_size
-                print(f"Minimum Notional Value: {min_notional_value} USDT")
-                
-            except (KeyError, TypeError, ValueError) as e:
-                print(f"Warning: Could not extract complete market information: {e}")
-                # Set fallback values
-                contract_size = 1.0
-                amount_precision = 2
-                price_precision = 2
-                min_amount = 0.01
-                min_cost = 5.0
-                min_notional_value = min_amount * current_price * contract_size
-                print(f"Using fallback values due to error: {e}")
+            # Use DOGE-specific contract details
+            contract_size = DOGE_CONFIG['contract_size']  # 100 DOGE per contract
+            min_amount = DOGE_CONFIG['min_contracts']     # 0.01 contracts minimum
+            amount_precision = DOGE_CONFIG['precision']   # 2 decimal places
+            
+            print(f"Contract Size: {contract_size} DOGE per contract")
+            print(f"Minimum Amount: {min_amount} contracts")
+            print(f"Amount Precision: {amount_precision} decimal places")
             
             # Calculate position size with improved error handling
             balance_info = self.exchange.fetch_balance()
             available_balance = float(balance_info['USDT']['free'])
+            
+            # Also check the actual margin available for trading
+            margin_available = float(balance_info.get('USDT', {}).get('free', 0))
+            if 'info' in balance_info and 'data' in balance_info['info']:
+                for item in balance_info['info']['data']:
+                    if item.get('ccy') == 'USDT' and 'availEq' in item:
+                        margin_available = float(item['availEq'])
+                        break
+            
             print(f"\n----- Account Information -----")
             print(f"Available Balance: {available_balance} USDT")
+            print(f"Available Margin: {margin_available} USDT")
             
             # Calculate position size based on risk percentage (1% of balance)
-            risk_amount_usdt = available_balance * RISK_CONFIG['position_size_pct']
-            print(f"Risk Amount (1%): {risk_amount_usdt} USDT")
+            actual_available = min(available_balance, margin_available)
             
-            # Validate against minimum possible trade
-            if risk_amount_usdt < (min_notional_value / self.leverage):
-                print(f"Warning: 1% risk ({risk_amount_usdt} USDT) is below minimum required for this market")
-                print(f"Minimum required: {min_notional_value / self.leverage} USDT with {self.leverage}x leverage")
-                if min_notional_value / self.leverage <= available_balance * 0.05:
-                    # Allow up to 5% risk for small accounts
-                    risk_amount_usdt = min_notional_value / self.leverage
-                    print(f"Adjusting risk amount to minimum: {risk_amount_usdt} USDT ({(risk_amount_usdt/available_balance)*100:.2f}% of balance)")
-                else:
-                    print("Error: Minimum trade exceeds 5% of balance - too risky")
-                    return False
+            # Scale position size based on confidence level
+            # Normalize confidence between min_confidence and 1.0
+            confidence_scale = (confidence - RISK_CONFIG['min_confidence']) / (1.0 - RISK_CONFIG['min_confidence'])
+            # Ensure it's between 0.3 (minimum) and 1.0 (maximum)
+            confidence_scale = max(0.3, min(1.0, confidence_scale))
+            
+            # Apply scaled risk
+            scaled_risk = RISK_CONFIG['position_size_pct'] * confidence_scale
+            risk_amount_usdt = actual_available * scaled_risk
+            
+            print(f"Confidence: {confidence:.2f}, Scale: {confidence_scale:.2f}")
+            print(f"Risk Amount ({scaled_risk*100:.2f}%): {risk_amount_usdt} USDT")
             
             # Apply leverage to calculate notional value
             leveraged_value = risk_amount_usdt * self.leverage
             print(f"Leveraged Value: {leveraged_value} USDT")
             
-            # Calculate contract quantity
+            # Calculate contract quantity for DOGE specifically
             try:
-                # Calculate raw contract quantity with clearer formula
-                nominal_exposure = leveraged_value  # This is how much exposure we want
-                contract_value = current_price * contract_size  # Value of one contract
+                contract_value = current_price * contract_size  # Value of one contract in USDT
+                contract_quantity = leveraged_value / contract_value
                 
-                # The formula: contracts = (balance * risk * leverage) / (price * contract_size)
-                contract_quantity = nominal_exposure / contract_value
+                print(f"Contract calculation: {leveraged_value} USDT / ({current_price} USDT * {contract_size} DOGE) = {contract_quantity} contracts")
                 
-                print(f"Contract calculation: {nominal_exposure} USDT / ({current_price} USDT * {contract_size} units) = {contract_quantity} contracts")
+                # Round to 2 decimal places for DOGE
+                contract_quantity = round(contract_quantity, amount_precision)
+                print(f"Rounded to {amount_precision} decimal place: {contract_quantity} contracts")
                 
-                # Validate quantity before rounding
-                if contract_quantity <= 0:
-                    print(f"Error: Invalid contract quantity calculated: {contract_quantity}")
-                    return False
-                
-                # Round to market precision
-                if amount_precision == 0:
-                    # For markets that only accept whole number quantities
-                    contract_quantity = int(contract_quantity)
-                    print(f"Rounded to whole number: {contract_quantity} contracts")
-                else:
-                    # For markets that accept decimal quantities
-                    contract_quantity = round(contract_quantity, amount_precision)
-                    print(f"Rounded to precision {amount_precision}: {contract_quantity} contracts")
-                
-                # Check against minimum amount
+                # Check against minimum amount (0.01 contracts for DOGE)
                 if contract_quantity < min_amount:
-                    if min_amount * contract_value / self.leverage <= available_balance * 0.05:
-                        print(f"Increasing quantity to minimum: {min_amount} contracts")
+                    print(f"Increasing quantity to minimum: {min_amount} contracts")
+                    contract_quantity = min_amount
+                
+                # Adjust for insufficient margin by reducing position size if needed
+                original_quantity = contract_quantity
+                for reduction_factor in [1.0, 0.8, 0.5, 0.3, 0.2]:
+                    contract_quantity = round(original_quantity * reduction_factor, amount_precision)
+                    if contract_quantity < min_amount:
                         contract_quantity = min_amount
-                    else:
-                        print("Error: Minimum quantity exceeds 5% of available balance")
-                        return False
+                    
+                    actual_exposure = contract_quantity * contract_value
+                    margin_required = actual_exposure / self.leverage
+                    
+                    print(f"Trying with {contract_quantity} contracts")
+                    print(f"Required margin: {margin_required:.2f} USDT")
+                    print(f"Available margin: {margin_available:.2f} USDT")
+                    
+                    if margin_required <= margin_available * 0.95:  # 5% safety buffer
+                        print(f"Using {contract_quantity} contracts ({reduction_factor*100:.0f}% of original calculation)")
+                        break
+                        
+                    if reduction_factor == 0.2:
+                        if min_amount * contract_value / self.leverage <= margin_available * 0.95:
+                            contract_quantity = min_amount
+                            print(f"Using minimum order size: {min_amount} contracts")
+                        else:
+                            print(f"Insufficient margin even for minimum contract size. Cannot trade.")
+                            return False
                 
-                # Double-check the actual exposure
-                actual_exposure = contract_quantity * contract_value
-                actual_risk_pct = (actual_exposure / self.leverage) / available_balance
-                print(f"Actual exposure: {actual_exposure} USDT ({actual_risk_pct*100:.2f}% of balance with leverage)")
+                actual_risk_pct = (contract_quantity * contract_value / self.leverage) / actual_available
+                print(f"Actual exposure: {contract_quantity * contract_value:.2f} USDT ({actual_risk_pct*100:.2f}% of balance with leverage)")
                 
-                # Set the position size with direction
                 desired_size = contract_quantity * (1 if signal > 0 else -1)
                 
             except (TypeError, ValueError, ZeroDivisionError) as e:
@@ -681,39 +640,37 @@ class MLTradingBot:
                 current_side = current_position['side']
                 signal_side = 'long' if signal > 0 else 'short'
                 
-                # If signal direction is opposite to current position, close it
                 if (signal > 0 and current_side == 'short') or (signal < 0 and current_side == 'long'):
                     print(f"Signal direction change detected: {current_side} -> {signal_side}")
                     
-                    # Create order to close current position
-                    close_order = self.exchange.create_order(
-                        self.symbol,
-                        'market',
-                        'buy' if current_side == 'short' else 'sell',
-                        current_position['size'],
-                        params={'reduceOnly': True}
-                    )
-                    
-                    print(f"Closed existing {current_side} position: {close_order['id']}")
-                    print(f"Position size: {current_position['size']} contracts")
-                    print(f"Entry price: {current_position['entry_price']}")
-                    
-                    # Reset current position
-                    current_position = None
+                    try:
+                        close_order = self.exchange.create_order(
+                            self.symbol,
+                            'market',
+                            'buy' if current_side == 'short' else 'sell',
+                            current_position['size'],
+                            params={'reduceOnly': True, 'posSide': current_side}
+                        )
+                        
+                        print(f"Closed existing {current_side} position: {close_order['id']}")
+                        print(f"Position size: {current_position['size']} contracts")
+                        print(f"Entry price: {current_position['entry_price']}")
+                        
+                        current_position = None
+                    except Exception as e:
+                        print(f"Error closing position: {e}")
+                        print(traceback.format_exc())
+                        return False
                 
-                # If signal matches current position direction, add to the position if confidence is high enough
                 elif (signal > 0 and current_side == 'long') or (signal < 0 and current_side == 'short'):
-                    # Only add if confidence is higher than threshold + 5%
                     if confidence > (RISK_CONFIG['min_confidence'] + 0.05):
                         print(f"Adding to existing {current_side} position")
                         print(f"Current position: {current_position['size']} contracts at {current_position['entry_price']}")
                         
-                        # Calculate new average entry price
                         total_position_value = (current_position['size'] * current_position['entry_price']) + (abs(desired_size) * current_price)
                         total_size = current_position['size'] + abs(desired_size)
                         new_avg_entry = total_position_value / total_size
                         
-                        # Create order to add to position
                         side = 'buy' if signal > 0 else 'sell'
                         try:
                             order = self.exchange.create_order(
@@ -730,7 +687,6 @@ class MLTradingBot:
                             print(f"New total size: {total_size} contracts")
                             print(f"New average entry: {new_avg_entry}")
                             
-                            # Update position tracking
                             if self.symbol in self.active_positions:
                                 self.active_positions[self.symbol].update({
                                     'size': total_size,
@@ -739,6 +695,28 @@ class MLTradingBot:
                                 })
                             
                             return True
+                        except ccxt.InsufficientFunds as e:
+                            print(f"Insufficient funds when adding to position: {e}")
+                            try:
+                                smaller_size = abs(desired_size) * 0.5
+                                if smaller_size >= min_amount:
+                                    print(f"Retrying with smaller position: {smaller_size} contracts")
+                                    order = self.exchange.create_order(
+                                        self.symbol,
+                                        'market',
+                                        side,
+                                        smaller_size,
+                                        None,
+                                        {'tdMode': 'cross', 'posSide': current_side}
+                                    )
+                                    print(f"Successfully added smaller position: {order['id']}")
+                                    return True
+                                else:
+                                    print(f"Cannot reduce further below minimum: {min_amount}")
+                                    return False
+                            except Exception as inner_e:
+                                print(f"Error with smaller position: {inner_e}")
+                                return False
                         except Exception as e:
                             print(f"Error adding to position: {e}")
                             return False
@@ -746,25 +724,30 @@ class MLTradingBot:
                         print(f"Not adding to position - confidence {confidence:.2f} below threshold {RISK_CONFIG['min_confidence'] + 0.05:.2f}")
                         return False
             
-            # If no current position or position was closed, open a new one
             if not current_position and abs(desired_size) >= min_amount:
                 side = 'buy' if signal > 0 else 'sell'
                 pos_side = 'long' if signal > 0 else 'short'
                 
                 try:
+                    order_params = {
+                        'tdMode': 'cross',
+                        'posSide': pos_side,
+                    }
+
+                    print(f"Placing {side} order for {abs(desired_size)} contracts of {self.symbol}")
+                
                     order = self.exchange.create_order(
                         self.symbol,
                         'market',
                         side,
                         abs(desired_size),
                         None,
-                        {'tdMode': 'cross', 'posSide': pos_side}
+                        order_params
                     )
                     
                     print(f"New position opened: {order['id']}")
                     print(f"Trade details: {side} {abs(desired_size)} contracts at ~{current_price}")
                     
-                    # Set up trailing stop tracking
                     self.active_positions[self.symbol] = {
                         'side': pos_side,
                         'size': abs(desired_size),
@@ -777,6 +760,36 @@ class MLTradingBot:
                     }
                     
                     return True
+                except ccxt.InsufficientFunds as e:
+                    print(f"Insufficient funds error: {e}")
+                    try:
+                        smaller_size = abs(desired_size) * 0.5
+                        if smaller_size >= min_amount:
+                            print(f"Retrying with smaller position: {smaller_size} contracts")
+                            order = self.exchange.create_order(
+                                self.symbol,
+                                'market',
+                                side,
+                                smaller_size,
+                                None,
+                                {'tdMode': 'cross', 'posSide': pos_side}
+                            )
+                            print(f"Successfully opened smaller position: {order['id']}")
+                            
+                            self.active_positions[self.symbol] = {
+                                'side': pos_side,
+                                'size': smaller_size,
+                                'entry_price': current_price,
+                                'current_price': current_price,
+                                'initial_stop': current_price * (1 - RISK_CONFIG['trailing_stop_initial'] if signal > 0 else 1 + RISK_CONFIG['trailing_stop_initial']),
+                                'current_stop': current_price * (1 - RISK_CONFIG['trailing_stop_initial'] if signal > 0 else 1 + RISK_CONFIG['trailing_stop_initial']),
+                                'highest_price': current_price if signal > 0 else float('-inf'),
+                                'lowest_price': current_price if signal < 0 else float('inf')
+                            }
+                            return True
+                    except Exception as inner_e:
+                        print(f"Error with smaller position: {inner_e}")
+                        return False
                 except Exception as e:
                     print(f"Error opening new position: {e}")
                     print(traceback.format_exc())
@@ -881,7 +894,7 @@ class MLTradingBot:
             for i in range(len(predictions)):
                 confidence = max(confidence_scores[i])
                 signal = 1 if predictions[i] == 1 else -1
-                
+                    
                 # Only trade if confidence is sufficient
                 if confidence > RISK_CONFIG['min_confidence']:
                     # Close existing position if direction changes
@@ -917,9 +930,9 @@ class MLTradingBot:
                             'side': 'long' if signal > 0 else 'short',
                             'size': position_size
                         })
-                
+            
                 # Update trailing stop if position exists
-                if position:
+            if position:
                     if position['side'] > 0:  # Long position
                         # Update highest price seen
                         highest_price = max(test_prices[i], position.get('highest_price', test_prices[i]))
@@ -1113,12 +1126,28 @@ class MLTradingBot:
                     # Execute trade with enhanced confidence check
                     if confidence > RISK_CONFIG['min_confidence']:
                         signal = 1 if prediction == 1 else -1
-                        print(f"⚠️ Signal triggered: {'LONG' if signal > 0 else 'SHORT'} with confidence {confidence:.2f}")
+                        print(f"!!! Signal triggered: {'LONG' if signal > 0 else 'SHORT'} with confidence {confidence:.2f}")
+                        
+                        # Check if we already have a position in the same direction
+                        has_matching_position = False
+                        for pos in positions:
+                            if pos['symbol'] == self.symbol and float(pos['contracts']) > 0:
+                                current_side = pos['side']
+                                if (signal > 0 and current_side == 'long') or (signal < 0 and current_side == 'short'):
+                                    has_matching_position = True
+                                    print(f"Already have a matching {current_side} position - will add to it if confidence is sufficient")
+                                    break
+                        
                         # Adjust signal strength based on regime
                         current_regime = features['regime_volatile'].iloc[-1]
                         if current_regime == 1:
                             signal *= 0.7  # Reduce position size in volatile markets
-                        self.execute_trade(signal, confidence)
+                            
+                        # Only execute trade if not already trading in same direction or confidence is high enough to add
+                        if not has_matching_position or confidence > (RISK_CONFIG['min_confidence'] + 0.01):
+                            self.execute_trade(signal, confidence)
+                        else:
+                            print(f"Skipping trade - already have a position in the same direction and confidence {confidence:.2f} not high enough to add")
                     else:
                         print(f"No trade - confidence {confidence:.2f} below threshold {RISK_CONFIG['min_confidence']:.2f}")
                     
@@ -1142,108 +1171,72 @@ class MLTradingBot:
             time.sleep(60)
 
 def run_backtest_all_coins():
-    while True:
-        try:
-            # List of coins with contract value < $1
-            coins = [
-                'DOGE/USDT:USDT',    # ~$0.07 per contract
-                'TRX/USDT:USDT',     # ~$0.08 per contract
-                'XRP/USDT:USDT',     # ~$0.60 per contract
-                'XLM/USDT:USDT',     # ~$0.11 per contract
-                'ADA/USDT:USDT',     # ~$0.60 per contract
-                'SHIB/USDT:USDT',    # ~$0.07 per contract
-            ]
-            results = {}
-            best_coin = None
-            best_accuracy = 0
-            
-            for coin in coins:
-                print(f"\nRunning backtest for {coin}...")
-                bot = MLTradingBot()
-                bot.symbol = coin
-                
-                try:
-                    # Get market info before testing
-                    market = bot.exchange.market(coin)
-                    print("\nMarket Information:")
-                    print(f"Minimum Amount: {market['limits']['amount']['min']} contracts")
-                    print(f"Maximum Amount: {market['limits']['amount']['max']} contracts")
-                    print(f"Contract Size: {market.get('contractSize', 'N/A')}")
-                    print(f"Price Precision: {market['precision']['price']}")
-                    print(f"Amount Precision: {market['precision']['amount']}")
-                    
-                    # Calculate minimum position value in USDT
-                    ticker = bot.exchange.fetch_ticker(coin)
-                    min_position_value = market['limits']['amount']['min'] * ticker['last']
-                    print(f"Minimum Position Value: {min_position_value:.4f} USDT")
-                    print(f"Current Price: {ticker['last']} USDT")
-                    
-                    # Fetch historical data
-                    backtest_data = bot.exchange.fetch_ohlcv(
-                        bot.symbol,
-                        bot.timeframe,
-                        limit=TRADING_CONFIG['backtest_limit']
-                    )
-                    
-                    backtest_df = pd.DataFrame(backtest_data, 
-                                             columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                    backtest_df['Timestamp'] = pd.to_datetime(backtest_df['Timestamp'], unit='ms')
-                    backtest_df = backtest_df.set_index('Timestamp')
-                    
-                    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                        backtest_df[col] = backtest_df[col].astype(float)
-                    
-                    backtest_features = bot.prepare_features(backtest_df)
-                    backtest_labels = (backtest_df['Close'].shift(-1) > backtest_df['Close']).astype(int)[:-1]
-                    
-                    # Run backtest and unpack the multiple return values
-                    is_successful, accuracy, final_balance, returns = bot.backtest(backtest_df, backtest_features[:-1], backtest_labels)
-                    
-                    results[coin] = {
-                        'Accuracy': accuracy,
-                        'Returns': returns,
-                        'Final Balance': final_balance
-                    }
-                    
-                    if accuracy > best_accuracy:
-                        best_accuracy = accuracy
-                        best_coin = coin
-                
-                except Exception as e:
-                    print(f"Error testing {coin}: {str(e)}")
-                    continue
-            
-            print("\n=== Complete Backtest Results ===")
-            for coin, metrics in results.items():
-                print(f"\n{coin} Results:")
-                print(f"Accuracy: {metrics['Accuracy']:.2f}%")
-                print(f"Returns: {metrics['Returns']:.2f}%")
-                print(f"Final Balance: {metrics['Final Balance']:.2f} USDT")
-            
-            if best_coin and best_accuracy >= 50:
-                try:
-                    bot = MLTradingBot()
-                    bot.symbol = best_coin
-                    should_restart = bot.run()
-                except Exception as e:
-                    print(f"Live trading error with {best_coin}: {str(e)}")
-                    continue
-                    
-                if should_restart:
-                    print("Scheduled restart initiated...")
-                    time.sleep(5)
-                    continue
-            
-            else:
-                print("\nNo coin met the minimum accuracy threshold of 50%. Waiting 15 minutes before retry...")
-                time.sleep(900)  # Wait 15 minutes before trying again
+    try:
+        print(f"\nRunning backtest for DOGE/USDT:USDT...")
+        bot = MLTradingBot()
+        bot.symbol = 'DOGE/USDT:USDT'
         
+        try:
+            # Get market info before testing
+            market = bot.exchange.market(bot.symbol)
+            ticker = bot.exchange.fetch_ticker(bot.symbol)
+            current_price = float(ticker['last'])
+            
+            print("\nDOGE Market Information:")
+            print(f"Current Price: {current_price} USDT")
+            print(f"Contract Size: {DOGE_CONFIG['contract_size']} DOGE")
+            print(f"Minimum Contract: {DOGE_CONFIG['min_contracts']} contracts")
+            print(f"Precision: {DOGE_CONFIG['precision']} decimal places")
+            
+            # Fetch historical data
+            backtest_data = bot.exchange.fetch_ohlcv(
+                bot.symbol,
+                bot.timeframe,
+                limit=TRADING_CONFIG['backtest_limit']
+            )
+            
+            backtest_df = pd.DataFrame(backtest_data, 
+                                       columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            backtest_df['Timestamp'] = pd.to_datetime(backtest_df['Timestamp'], unit='ms')
+            backtest_df = backtest_df.set_index('Timestamp')
+            
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                backtest_df[col] = backtest_df[col].astype(float)
+            
+            backtest_features = bot.prepare_features(backtest_df)
+            backtest_labels = (backtest_df['Close'].shift(-1) > backtest_df['Close']).astype(int)[:-1]
+            
+            # Run backtest and unpack the multiple return values
+            is_successful, accuracy, final_balance, returns = bot.backtest(backtest_df, backtest_features[:-1], backtest_labels)
+            
+            print("\n=== DOGE Backtest Results ===")
+            print(f"Accuracy: {accuracy:.2f}%")
+            print(f"Returns: {returns:.2f}%")
+            print(f"Final Balance: {final_balance:.2f} USDT")
+            
+            # Start live trading if backtest was successful
+            if is_successful:
+                print("\nBacktest successful! Starting live trading...")
+                bot.run()
+            else:
+                print("\nBacktest not successful. Accuracy below threshold.")
+                print("Waiting 15 minutes before retrying...")
+                time.sleep(900)  # Wait 15 minutes
+                run_backtest_all_coins()  # Try again
+                
         except Exception as e:
-            print(f"Critical error in main loop: {str(e)}")
-            print("Stack trace:", traceback.format_exc())
-            print("Restarting in 5secs ...")
-            time.sleep(5)
+            print(f"Error in DOGE backtest: {str(e)}")
+            print(traceback.format_exc())
+            time.sleep(60)
+            run_backtest_all_coins()  # Try again after error
+    
+    except Exception as e:
+        print(f"Critical error: {str(e)}")
+        print(traceback.format_exc())
+        print("Restarting in 5 seconds...")
+        time.sleep(5)
+        run_backtest_all_coins()
 
 if __name__ == "__main__":
-    print("Starting Enhanced ML Trading Bot...\n")
-    run_backtest_all_coins()  # This will now run indefinitely
+    print("Starting DOGE-focused ML Trading Bot...\n")
+    run_backtest_all_coins()
